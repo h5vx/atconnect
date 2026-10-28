@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Audio-Technica Connect
+Comment=Control Audio-Technica Bluetooth headphones
+Exec=atconnect-gtk
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+StartupWMClass=io.github.atconnect
