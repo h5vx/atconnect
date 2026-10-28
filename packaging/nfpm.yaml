@@ -1,0 +1,43 @@
+name: atconnect
+arch: all
+platform: linux
+version: ${VERSION}
+release: ${RELEASE}
+section: sound
+priority: optional
+maintainer: h5vx <h5v@protonmail.com>
+vendor: h5vx
+homepage: https://github.com/h5vx/atconnect
+license: MIT
+description: |
+  Linux companion app for Audio-Technica Bluetooth headphones.
+  Controls the ATH-M50xBT2: equalizer, codec, low latency, sidetone,
+  multipoint, voice guidance and more. Command line tool and GTK 4 app.
+
+contents:
+  - src: ./build/stage/usr/
+    dst: /usr/
+    type: tree
+
+overrides:
+  deb:
+    depends:
+      - python3 (>= 3.11)
+      - python3-gi
+      - gir1.2-gtk-4.0
+      - gir1.2-adw-1 (>= 1.6)
+      - bluez
+  rpm:
+    depends:
+      - python3 >= 3.11
+      - python3-gobject
+      - gtk4
+      - libadwaita >= 1.6
+      - bluez
+  archlinux:
+    depends:
+      - python
+      - python-gobject
+      - gtk4
+      - libadwaita
+      - bluez

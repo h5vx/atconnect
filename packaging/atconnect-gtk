@@ -1,0 +1,5 @@
+#!/bin/sh
+# Relocatable launcher: works from /usr/bin and from an unpacked tarball.
+prefix=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+exec python3 -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from atconnect.gui import main; main()' \
+    "$prefix/lib/atconnect" "$@"

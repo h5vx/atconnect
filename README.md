@@ -24,8 +24,13 @@ Companion-приложение для беспроводных наушнико�
 
 ## Установка
 
-Нужны BlueZ и системные PyGObject, GTK 4, libadwaita ≥ 1.6
-(`python3-gi gir1.2-gtk-4.0 gir1.2-adw-1`).
+Готовые пакеты — на странице [Releases](https://github.com/h5vx/atconnect/releases):
+`.deb` (Debian 13+, Ubuntu 24.10+), `.rpm` (Fedora), `.pkg.tar.zst` (Arch Linux) и
+`.tar.gz`, который можно распаковать куда угодно и запускать `bin/atconnect`.
+Пакеты подтягивают PyGObject, GTK 4, libadwaita ≥ 1.6 и BlueZ; для tar.gz их нужно
+поставить самому.
+
+Из исходников:
 
 ```bash
 uv venv --python /usr/bin/python3 --system-site-packages

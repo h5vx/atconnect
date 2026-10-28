@@ -1,0 +1,143 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NFPM_VERSION: 2.48.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - run: uv run --python ${{ matrix.python }} pytest -v
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag=${GITHUB_REF#refs/tags/v}
+            if [[ "$tag" != "$version" ]]; then
+              echo "::error::tag v$tag does not match pyproject version $version"
+              exit 1
+            fi
+            release=1
+          else
+            release=0.${GITHUB_RUN_NUMBER}
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE=$release" >> "$GITHUB_ENV"
+
+      - name: Install nfpm
+        run: |
+          base=https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}
+          tarball=nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz
+          curl -fsSLO "$base/$tarball"
+          curl -fsSL "$base/checksums.txt" | grep " $tarball\$" | sha256sum -c -
+          sudo tar -xzf "$tarball" -C /usr/local/bin nfpm
+
+      - name: Stage install tree
+        run: packaging/stage.sh build/stage
+
+      - name: Build deb, rpm and Arch packages
+        run: |
+          mkdir -p dist
+          for p in deb rpm archlinux; do
+            nfpm package --config packaging/nfpm.yaml --packager "$p" --target dist/
+          done
+
+      - name: Build tarball
+        run: |
+          name=atconnect-${VERSION}-linux-noarch
+          mkdir -p "build/$name"
+          cp -a build/stage/usr/. "build/$name/"
+          tar -C build -czf "dist/$name.tar.gz" --owner=0 --group=0 "$name"
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+
+  smoke-test:
+    needs: package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debian
+            image: debian:trixie
+            install: apt-get update && apt-get install -y ./dist/*.deb
+          - name: fedora
+            image: fedora:latest
+            install: dnf install -y ./dist/*.rpm
+          - name: arch
+            image: archlinux:latest
+            install: pacman -Sy --noconfirm && pacman -U --noconfirm ./dist/*.pkg.tar.zst
+          - name: tarball
+            image: debian:trixie
+            install: >-
+              apt-get update && apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 &&
+              tar -xzf dist/*.tar.gz -C /opt && ln -s /opt/atconnect-*/bin/* /usr/local/bin/
+    container: ${{ matrix.image }}
+    name: smoke-test (${{ matrix.name }})
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist
+      - name: Install
+        run: ${{ matrix.install }}
+      - name: Run
+        run: |
+          atconnect --help
+          atconnect multipoint --help > /dev/null
+          python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import atconnect.gui' \
+            "$(dirname "$(readlink -f "$(command -v atconnect)")")/../lib/atconnect"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "atconnect $TAG" \
+            --generate-notes
