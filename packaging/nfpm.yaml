@@ -31,6 +31,7 @@ overrides:
     depends:
       - python3 >= 3.11
       - python3-gobject
+      - gobject-introspection
       - gtk4
       - libadwaita >= 1.6
       - bluez
