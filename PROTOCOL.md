@@ -84,19 +84,110 @@ Commands relevant to the ATH-M50xBT2 (all getters answer one byte unless noted):
 | 64 / 65     | low latency       | 0/1; unavailable with codec auto/LDAC/LHDC                |
 | 96 / 97     | sidetone          | 2 bytes: `on gain` (gain 0 low, 1 high)                   |
 
-## EQ on the ATH-M50xBT2
+## EQ on the ATH-M50xBT2 ("EQ V2")
 
-"EQ V2", 5 band GEQ at 82 / 247 / 1000 / 4000 / 12500 Hz (Q 0.8/0.7/0.7/0.7/0.8,
-global gain −6 dB). Presets are EQ banks:
+The app keeps its presets locally and writes the selected curve into **bank 5**
+(`eqV2Bank`). Presets are 5-band graphic EQs at 82 / 247 / 1000 / 4000 / 12500 Hz,
+Q 0.8 / 0.7 / 0.7 / 0.7 / 0.8, pre-gain −6 dB:
 
-| bank | preset         |
-|------|----------------|
-| 3    | Original       |
-| 5    | Bass Boost     |
-| 6    | Clear Vocal    |
-| 4    | V-shaped       |
-| 7    | Treble Enhance |
-| 1    | MySetting1 (custom) |
+| preset         | gains (dB)               |
+|----------------|--------------------------|
+| Original       | 0 0 0 0 0                |
+| Bass Boost     | 4.5 −3 −1 0 1.5          |
+| Clear Vocal    | −3 1.5 1 4 1.5           |
+| V-shaped       | 3 1 −2 1 3               |
+| Treble Enhance | −2 0.5 −0.5 2 4          |
 
-Writing custom band gains requires the biquad coefficient blob produced by
-`DspConfig.calculateEqNative` in `libDspConfig.so`; not implemented yet.
+(The banks 1–4/6/7 table in the model definition belongs to the older "EQ V1"
+flow and is not used with firmware > 0x1003.)
+
+Writing a curve (EQ spec 2, what `RNRtkEqModule.setEqParams` ends up sending):
+
+1. JS adjusts Q per band: `q' = round(q · 10^(|gain|/40), 1)`.
+2. For 44.1 kHz (rate code 3) and 48 kHz (code 4) compute `eqData` with
+   `DspConfig.calculateEqNative` and send
+   `0x0203  bank 00 00 len:u16le  rate  eqData` (len = 1 + len(eqData)).
+3. `0x0205 bank` selects the bank, AT `61` (`SAVE_EQ_PARAMETER`) `bank` persists it.
+
+The EQ itself is switched with `0x0201` / `0x0202` and queried with
+`0x0200 00` → `0x0200 00 enabled`. Toggling it makes the headphones restart the
+A2DP stream (the app waits for a reconnect when the codec is Auto/LDAC).
+
+`0x0204 bank` reads a bank back: `bank xx xx len:u16le rate eqData`, where the
+data is padded to 10 stages and the rate byte is not meaningful (reads 1).
+
+### eqData format (libDspConfig `calculateEq` → `getSpkEqData`)
+
+```
+u32  (SignedQuant(preGain · Π scale_i, 24 bits, 12 frac) << 8) | 0x40 | stages
+per stage: b0 b1 b2 a1 a2   as i32 Q2.30 (saturating)
+```
+
+Each stage is the "simple" peaking filter (Orfanidis), not the RBJ cookbook one:
+
+```
+G  = 10^(gain/20),  w0 = 2π·f/fs,  t = w0 / (2Q·min(G, 1))
+β  = −½·(1−t)/(1+t)
+b1 = a1 = −2·cos(w0)·(½ − β),  a2 = −2β
+b0 = 1 + 2(G−1)(¼ + β/2),      b2 = −2β − 2(G−1)(¼ + β/2)
+if any |b| ≥ 2: divide b0..b2 by the largest |b| and multiply the pre-gain by it
+b1, b2, a1, a2 are then rounded to the Q30 grid
+```
+
+`atconnect/eq.py` reproduces the native library byte for byte (checked against
+the armeabi-v7a `libDspConfig.so` run under an emulator).
+
+## Firmware version
+
+`0x0308` is rejected by the M50xBT2. The app reads the version through the OTA
+service instead (`RtkDfuModule.getAppUiVersion`):
+
+* `0x0600` → target info; for DFU spec ≤ 5 bytes 8..11 are a 2-bit-per-image
+  indicator.
+* `0x0601` (no parameters) → 4-byte versions of the present images, in image
+  order. Image 9 is the app config ("UI parameter") image.
+* The app shows/compares `((v>>12)&0xF000) + ((v>>8)&0x0F00) + ((v>>4)&0xF0) + (v&0xF)`,
+  e.g. `0x01000008` → `0x1008` → **1.0.0.8**. Feature gates in the model
+  definition (sidetone, EQ) test `version > 0x1003`.
+
+## Multipoint
+
+What the ATH-M50xBT2 firmware 1.0.0.8 actually does:
+
+| command                                   | result                                        |
+|-------------------------------------------|-----------------------------------------------|
+| AT 54 / 55 multipoint on/off              | works                                         |
+| AT 77 number of app connections           | works                                         |
+| AT 80–91 paired list/info/connect/…/pair  | ACKed, never answered (not implemented)       |
+| Realtek `0x0315` multilink connection num | unknown command                               |
+| MMI `0x51` enter pairing                  | works, **drops the link to this computer**    |
+| MMI `0x53` link last device               | accepted, link kept                           |
+
+The official app does not offer device management for this model either
+(`multipointManagement` is absent from its feature list).
+
+The headphones do report link changes on their own:
+
+```
+0x0003  profile_mask  addr[6] (little endian)              profile connected
+0x0004  profile_mask  addr[6] (little endian)  reason:u16  profile disconnected
+```
+
+Profile mask `0x01` = A2DP (verified); the remaining bits follow the Realtek
+profile mask (AVRCP 0x02, HFP 0x04, HSP 0x08, SPP 0x10, iAP 0x20).
+
+For firmwares that implement it, the management protocol is:
+
+| AT  | request payload                 | response payload                                   |
+|-----|---------------------------------|----------------------------------------------------|
+| 80  | –                               | `n addr[6]·n`                                      |
+| 81  | `addr[6]`                       | `addr[6] name_len name conn_profiles active supported_profiles` |
+| 82  | `addr[6]`                       | – (connect)                                        |
+| 83  | `addr[6]`                       | – (disconnect)                                     |
+| 84  | `addr[6] profile connect`       | – (profile 1 = A2DP, 2 = HFP)                      |
+| 87  | `addr[6]`                       | – (forget)                                         |
+| 89 / 90 | –                           | – (enter / cancel pairing without dropping links)  |
+| 91  | –                               | `addr[6]` (address of the app's host)              |
+
+Notifications: 85 `addr conn_profiles active?`, 86 `addr` (active device),
+88 `addr` (removed). Addresses here are big endian (`AA:BB:…` order).
