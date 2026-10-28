@@ -263,3 +263,80 @@ def connect(device: Device, timeout: float = 15.0, channel: int | None = None) -
     if result["conn"] is None:
         raise BluezError(result["err"])
     return result["conn"]
+
+
+# ---- link control from this computer's side -------------------------------
+
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+HFP_UUID = "0000111e-0000-1000-8000-00805f9b34fb"
+HSP_UUID = "00001108-0000-1000-8000-00805f9b34fb"
+PROFILE_UUIDS = {"a2dp": (A2DP_SINK_UUID,), "hfp": (HFP_UUID, HSP_UUID)}
+
+
+def adapter_address() -> str | None:
+    bus = _bus()
+    reply = bus.call_sync(
+        BLUEZ, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+        None, GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE, -1, None,
+    )
+    (objects,) = reply.unpack()
+    for ifaces in objects.values():
+        adapter = ifaces.get("org.bluez.Adapter1")
+        if adapter and adapter.get("Powered"):
+            return adapter.get("Address")
+    return None
+
+
+def known_device_names() -> dict[str, str]:
+    """Address -> name for every device BlueZ knows about (paired or merely seen)."""
+    bus = _bus()
+    reply = bus.call_sync(
+        BLUEZ, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+        None, GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE, -1, None,
+    )
+    (objects,) = reply.unpack()
+    names = {}
+    for ifaces in objects.values():
+        props = ifaces.get("org.bluez.Device1")
+        if props and props.get("Address"):
+            names[props["Address"].upper()] = props.get("Alias") or props.get("Name") or ""
+    return names
+
+
+def _device_call(device: Device, method: str, args: GLib.Variant | None = None, timeout_ms: int = 30000) -> None:
+    try:
+        _bus().call_sync(
+            BLUEZ, device.path, "org.bluez.Device1", method, args, None, Gio.DBusCallFlags.NONE, timeout_ms, None
+        )
+    except GLib.Error as e:
+        raise BluezError(f"{method} failed: {e.message}") from e
+
+
+def disconnect_device(device: Device) -> None:
+    """Drop every link between this computer and the headphones (hand them over)."""
+    _device_call(device, "Disconnect")
+
+
+def connect_device(device: Device) -> None:
+    _device_call(device, "Connect")
+
+
+def set_profile(device: Device, profile: str, connected: bool) -> None:
+    """Connect or disconnect the a2dp / hfp profile of this computer's link."""
+    uuids = PROFILE_UUIDS[profile]
+    method = "ConnectProfile" if connected else "DisconnectProfile"
+    errors = []
+    for uuid in uuids:
+        try:
+            _device_call(device, method, GLib.Variant("(s)", (uuid,)))
+            return
+        except BluezError as e:
+            errors.append(str(e))
+    raise BluezError("; ".join(errors))
+
+
+def refresh(device: Device) -> Device:
+    for d in list_devices(only_supported=False):
+        if d.path == device.path:
+            return d
+    return device

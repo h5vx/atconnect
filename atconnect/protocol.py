@@ -31,7 +31,9 @@ SPP_UUID = "00001101-0000-1000-8000-00805f9b34fb"
 
 class Op(enum.IntEnum):
     ACK = 0x0000
+    PROFILE_CONNECTED = 0x0003  # event: <profile mask> <address, little endian>
     MMI = 0x0004
+    PROFILE_DISCONNECTED = 0x0004  # event: <profile mask> <address, little endian> <reason:2>
     GET_CMD_SET_INFO = 0x000C
     CMD_SET_INFO = 0x0011  # event
     SET_CFG = 0x0012
@@ -41,12 +43,17 @@ class Op(enum.IntEnum):
     STATUS_REPORT = 0x0019  # event
     EQ_QUERY_INFO = 0x0200  # request and event
     EQ_ENABLE = 0x0201
+    EQ_PARAM_REPORT = 0x0201  # event, shares the value with EQ_ENABLE
     EQ_DISABLE = 0x0202
     EQ_INDEX_REPORT = 0x0202  # event, shares the value with EQ_DISABLE
+    EQ_SET_PARAM = 0x0203
+    EQ_GET_PARAM = 0x0204
     EQ_SET_INDEX = 0x0205
     EQ_GET_INDEX = 0x0206
     EQ_GET_INDEX_V0 = 0x0206  # event for older spec
     GET_FW_VERSION = 0x0308
+    OTA_GET_TARGET_INFO = 0x0600  # request and event
+    OTA_GET_IMAGE_INFO = 0x0601  # request and event
     FW_VERSION_REPORT = 0x0909  # event
     AT_SEND = 0x0800
     AT_RECEIVE = 0x8800
@@ -98,6 +105,7 @@ class At(enum.IntEnum):
     GET_PAIRED_DEVICE_INFO = 81
     CONNECT_TO_PAIRED_DEVICE = 82
     DISCONNECT_PAIRED_DEVICE = 83
+    CHANGE_PROFILE_OF_CONNECTED_DEVICE = 84
     REMOVE_PAIRED_DEVICE = 87
     ENTER_PAIRING_MODE = 89
     CANCEL_PAIRING_MODE = 90
@@ -190,10 +198,29 @@ class StatusIndex(enum.IntEnum):
 
 # MMI action codes (opcode 0x0004).
 class Mmi(enum.IntEnum):
-    ENTER_PAIRING = 0x51
+    ENTER_PAIRING = 0x51  # drops the current link on the ATH-M50xBT2
     EXIT_PAIRING = 0x52
+    LINK_LAST_DEVICE = 0x53
+    DISCONNECT_ALL_LINKS = 0x59
     FACTORY_RESET = 0x5A
     CLEAR_PAIRED_LIST = 0x5B
+
+
+class LinkProfile(enum.IntFlag):
+    """Realtek profile mask in PROFILE_(DIS)CONNECTED events (A2DP verified on the M50xBT2)."""
+
+    A2DP = 0x01
+    AVRCP = 0x02
+    HFP = 0x04
+    HSP = 0x08
+    SPP = 0x10
+    IAP = 0x20
+
+
+class BtProfile(enum.IntFlag):
+    NONE = 0
+    A2DP = 1
+    HFP = 2
 
 
 class ProtocolError(Exception):
@@ -328,3 +355,98 @@ def parse_cmd_set_info(params: bytes) -> tuple[int, int] | None:
     else:
         eq_spec = {0: 0, 1: 0, 256: 1, 257: 2, 258: 3, 259: 4, 260: 5}.get(cmd_set, 0)
     return cmd_set, eq_spec
+
+
+def bdaddr_bytes(address: str) -> bytes:
+    parts = address.split(":")
+    if len(parts) != 6:
+        raise ValueError(f"bad Bluetooth address: {address!r}")
+    return bytes(int(p, 16) for p in parts)
+
+
+def bdaddr_str(data: bytes) -> str:
+    if len(data) != 6:
+        raise ProtocolError(f"bad address bytes: {data.hex()}")
+    return ":".join(f"{b:02X}" for b in data)
+
+
+@dataclass(frozen=True)
+class PairedDevice:
+    address: str
+    name: str
+    connected: BtProfile  # profiles currently connected
+    active: bool
+    supported: BtProfile
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.connected)
+
+
+def parse_paired_device_list(payload: bytes) -> list[str]:
+    if not payload:
+        raise ProtocolError("empty paired device list")
+    count = payload[0]
+    if len(payload) < 1 + 6 * count:
+        raise ProtocolError(f"short paired device list: {payload.hex()}")
+    return [bdaddr_str(payload[1 + 6 * i : 7 + 6 * i]) for i in range(count)]
+
+
+def parse_paired_device_info(payload: bytes) -> PairedDevice:
+    """<addr:6> <name_len> <name> <connected profiles> <active> <supported profiles>"""
+    if len(payload) < 7 or len(payload) < 10 + payload[6]:
+        raise ProtocolError(f"short paired device info: {payload.hex()}")
+    n = payload[6]
+    name = payload[7 : 7 + n].decode("utf-8", "replace").strip("\x00 ")
+    return PairedDevice(
+        address=bdaddr_str(payload[:6]),
+        name=name,
+        connected=BtProfile(payload[7 + n] & 3),
+        active=payload[8 + n] != 0,
+        supported=BtProfile(payload[9 + n] & 3),
+    )
+
+
+def parse_ota_app_version(target_info: bytes, image_info: bytes) -> int | None:
+    """App config ("UI parameter") image version from OTA target/image info (DFU spec <= 5).
+
+    The app shows it as four nibbles, e.g. 0x1008 -> 1.0.0.8.
+    """
+    if len(target_info) < 12 or (target_info[1] & 0x0F) > 5:
+        return None
+    (indicator,) = struct.unpack_from("<I", target_info, 8)
+    pos = 0
+    versions: dict[int, int] = {}
+    for image in range(16):
+        if (indicator >> (image * 2)) & 3 == 0:
+            continue
+        if pos + 4 > len(image_info):
+            break
+        (versions[image],) = struct.unpack_from("<I", image_info, pos)
+        pos += 4
+    raw = versions.get(9)
+    if raw is None or raw == 0xFFFFFFFF:
+        return None
+    return ((raw >> 12) & 0xF000) + ((raw >> 8) & 0x0F00) + ((raw >> 4) & 0x00F0) + (raw & 0x000F)
+
+
+def format_app_version(v: int) -> str:
+    return ".".join(str((v >> s) & 0xF) for s in (12, 8, 4, 0))
+
+
+@dataclass(frozen=True)
+class LinkEvent:
+    connected: bool
+    profile: LinkProfile
+    address: str
+
+
+def parse_link_event(pkt: Packet) -> LinkEvent | None:
+    """Decode PROFILE_CONNECTED / PROFILE_DISCONNECTED events sent by the headphones."""
+    if pkt.opcode not in (Op.PROFILE_CONNECTED, Op.PROFILE_DISCONNECTED) or len(pkt.params) < 7:
+        return None
+    return LinkEvent(
+        connected=pkt.opcode == Op.PROFILE_CONNECTED,
+        profile=LinkProfile(pkt.params[0]),
+        address=bdaddr_str(pkt.params[1:7][::-1]),
+    )
